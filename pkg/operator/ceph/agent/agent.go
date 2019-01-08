@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/coreos/pkg/capnslog"
@@ -41,6 +42,7 @@ const (
 	agentDaemonsetTolerationEnv    = "AGENT_TOLERATION"
 	agentDaemonsetTolerationKeyEnv = "AGENT_TOLERATION_KEY"
 	AgentMountSecurityModeEnv      = "AGENT_MOUNT_SECURITY_MODE"
+	RookEnableSelinuxRelabelingEnv = "ROOK_ENABLE_SELINUX_RELABELING"
 
 	// MountSecurityModeAny "any" security mode for the agent for mount action
 	MountSecurityModeAny = "Any"
@@ -83,6 +85,16 @@ func (a *Agent) createAgentDaemonSet(namespace, agentImage, serviceAccount strin
 	}
 	if agentMountSecurityMode != MountSecurityModeAny && agentMountSecurityMode != MountSecurityModeRestricted {
 		return fmt.Errorf("invalid agent mount security mode specified (given: %s)", agentMountSecurityMode)
+	}
+
+	rookEnableSelinuxRelabeling := os.Getenv(RookEnableSelinuxRelabelingEnv)
+	if rookEnableSelinuxRelabeling != "" {
+		_, err := strconv.ParseBool(rookEnableSelinuxRelabeling)
+		if err != nil {
+			return fmt.Errorf("invalid %s boolean value (given: %s)", RookEnableSelinuxRelabelingEnv, rookEnableSelinuxRelabeling)
+		}
+	} else {
+		rookEnableSelinuxRelabeling = "true"
 	}
 
 	privileged := true
@@ -132,6 +144,7 @@ func (a *Agent) createAgentDaemonSet(namespace, agentImage, serviceAccount strin
 								k8sutil.NamespaceEnvVar(),
 								k8sutil.NodeEnvVar(),
 								{Name: AgentMountSecurityModeEnv, Value: agentMountSecurityMode},
+								{Name: RookEnableSelinuxRelabelingEnv, Value: rookEnableSelinuxRelabeling},
 							},
 						},
 					},
@@ -266,6 +279,212 @@ func (a *Agent) discoverFlexvolumeDir() (flexvolumeDirPath, source string) {
 	}
 
 	return getDefaultFlexvolumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+	return getDefaultFlexvolumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+be 'mountname=/host/path:/container/path,mountname2=/host/path2:/container/path2'", agentMounts)
+			}
+			ds.Spec.Template.Spec.Containers[0].VolumeMounts = append(ds.Spec.Template.Spec.Containers[0].VolumeMounts, v1.VolumeMount{
+				Name:      mountname,
+				MountPath: paths[1],
+			})
+			ds.Spec.Template.Spec.Volumes = append(ds.Spec.Template.Spec.Volumes, v1.Volume{
+				Name: mountname,
+				VolumeSource: v1.VolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Path: paths[0],
+					},
+				},
+			})
+		}
+	}
+
+	// Add toleration if any
+	tolerationValue := os.Getenv(agentDaemonsetTolerationEnv)
+	if tolerationValue != "" {
+		ds.Spec.Template.Spec.Tolerations = []v1.Toleration{
+			{
+				Effect:   v1.TaintEffect(tolerationValue),
+				Operator: v1.TolerationOpExists,
+				Key:      os.Getenv(agentDaemonsetTolerationKeyEnv),
+			},
+		}
+	}
+
+	_, err := a.clientset.Extensions().DaemonSets(namespace).Create(ds)
+	if err != nil {
+		if !kserrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create rook-ceph-agent daemon set. %+v", err)
+		}
+		logger.Infof("rook-ceph-agent daemonset already exists, updating ...")
+		_, err = a.clientset.Extensions().DaemonSets(namespace).Update(ds)
+		if err != nil {
+			return fmt.Errorf("failed to update rook-ceph-agent daemon set. %+v", err)
+		}
+	} else {
+		logger.Infof("rook-ceph-agent daemonset started")
+	}
+	return nil
+
+}
+
+func (a *Agent) discoverFlexvolumeDir() (flexvolumeDirPath, source string) {
+	//copy flexvolume to flexvolume dir
+	nodeName := os.Getenv(k8sutil.NodeNameEnvVar)
+	if nodeName == "" {
+		logger.Warningf("cannot detect the node name. Please provide using the downward API in the rook operator manifest file")
+		return getDefaultFlexvolumeDir()
+	}
+
+	// determining where the path of the flexvolume dir on the node
+	nodeConfigURI, err := k8sutil.NodeConfigURI()
+	if err != nil {
+		logger.Warning(err.Error())
+		return getDefaultFlexvolumeDir()
+	}
+	nodeConfig, err := a.clientset.CoreV1().RESTClient().Get().RequestURI(nodeConfigURI).DoRaw()
+	if err != nil {
+		logger.Warningf("unable to query node configuration: %v", err)
+		return getDefaultFlexvolumeDir()
+	}
+
+	// unmarshal to a KubeletConfiguration
+	kubeletConfiguration := KubeletConfiguration{}
+	if err := json.Unmarshal(nodeConfig, &kubeletConfiguration); err != nil {
+		logger.Warningf("unable to parse node config as kubelet configuration: %+v", err)
+	} else {
+		flexvolumeDirPath = kubeletConfiguration.KubeletConfig.VolumePluginDir
+	}
+
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "KubeletConfiguration"
+	}
+
+	return getDefaultFlexvolumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+	return getDefaultFlexvolumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+volumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+volumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+volumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+volumeDir()
+}
+
+func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
+	logger.Infof("getting flexvolume dir path from %s env var", flexvolumePathDirEnv)
+	flexvolumeDirPath = os.Getenv(flexvolumePathDirEnv)
+	if flexvolumeDirPath != "" {
+		return flexvolumeDirPath, "env var"
+	}
+
+	logger.Infof("flexvolume dir path env var %s is not provided. Defaulting to: %s",
+		flexvolumePathDirEnv, flexvolumeDefaultDirPath)
+	flexvolumeDirPath = flexvolumeDefaultDirPath
+
+	return flexvolumeDirPath, "default"
+}
+volumeDir()
 }
 
 func getDefaultFlexvolumeDir() (flexvolumeDirPath, source string) {
